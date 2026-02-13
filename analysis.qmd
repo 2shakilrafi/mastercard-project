@@ -1,0 +1,903 @@
+---
+title: "Gaussian Mixture Model Project"
+author: "Shakil A. Rafi, Ph.D."
+format: html
+editor: visual
+toc: true
+---
+
+## Preprocessing the `XLSX` file.
+
+We will read the `XLSX` file, and create tibbles that are same title as the worksheets, we will rename the column headers using `janitor` and write out csv files with the same title as the worksheets.
+
+```{r}
+#| warning: false
+
+library(readxl)
+library(tidyverse)
+library(janitor)
+library(stringr)
+
+file_path <- "raw-data.xlsx"
+out_dir <- "raw-csv"
+
+# Ensure output directory exists
+dir.create(out_dir, showWarnings = FALSE)
+
+# Get sheet names
+sheet_names <- excel_sheets(file_path)
+
+# Normalize names: lowercase + hyphens
+clean_sheet_names <- sheet_names |>
+  str_to_lower() |>
+  str_replace_all("\\s+", "-")
+
+# Read sheets into named tibbles
+sheets <- map2(
+  sheet_names,
+  clean_sheet_names,
+  ~ read_excel(file_path, sheet = .x) |>
+      clean_names()
+) |>
+  set_names(clean_sheet_names)
+
+# Write CSVs to raw-csv/
+walk2(
+  sheets,
+  names(sheets),
+  ~ write_csv(.x, file.path(out_dir, paste0(.y, ".csv")))
+)
+
+```
+
+## Reconstructing and synthesizing store sales data from `Store 1`
+
+First we reconstruct sale data using:
+
+$$
+S_t = S_0 + \sum_{i=0}^{i=t} (S_{i+1} - S_i)
+$$
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+sheets$`store-1` |>
+  mutate(
+    # Replace NA diff in week 1 with 0
+    diff = replace_na(difference_from_previous_week, 0),
+
+    # Reconstruct sales path with arbitrary start
+    sales_raw = cumsum(diff)
+  ) |>
+  mutate(
+    # Shift by constant so yearly mean matches the true mean
+    sales = sales_raw + (2425553 - mean(sales_raw))
+  ) |>
+  select(-diff, -sales_raw) -> store_1_recon
+```
+
+We give ourselves a visual of the sales figures.
+
+```{r}
+store_1_recon |>
+  mutate(
+    week_num = readr::parse_number(week)
+  ) |>
+  ggplot(aes(x = factor(week, levels = week[order(week_num)]), y = sales)) +
+  geom_col() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(
+    title = "Sales by Week",
+    x = "Week",
+    y = "Sales"
+  )
+
+
+```
+
+### Fitting a GMM model and examining it
+
+```{r}
+#| warning: false
+library(tidyverse)
+library(mclust)
+
+# df: your data
+# columns: week, difference_from_previous_week, sales
+
+# --- 1) Prep: make sure deltas are numeric and remove NA (week 1)
+df_delta <- store_1_recon %>%
+  mutate(
+    difference_from_previous_week = as.numeric(difference_from_previous_week),
+    sales = as.numeric(sales)
+  ) %>%
+  filter(!is.na(difference_from_previous_week))
+
+# --- 2) Standardize deltas (important for GMM stability)
+scaler <- df_delta %>%
+  summarize(
+    mu = mean(difference_from_previous_week),
+    sd = sd(difference_from_previous_week)
+  )
+
+df_z <- df_delta %>%
+  mutate(
+    delta_z = (difference_from_previous_week - scaler$mu) / scaler$sd
+  )
+
+# --- 3) Fit GMM for k = 1..Kmax, select by BIC
+Kmax <- 6
+
+gmm <- Mclust(df_z$delta_z, G = 1:Kmax)
+
+# What did it pick?
+gmm$G
+summary(gmm)
+```
+
+```{r}
+gmm$G
+```
+
+```{r}
+plot(gmm, what = "BIC")
+```
+
+```{r}
+gmm$parameters
+```
+
+```{r}
+plot(gmm, what = "density")
+```
+
+### Creating Synthetic Values
+
+```{r}
+set.seed(42)
+
+params  <- gmm$parameters
+weights <- params$pro
+means_z <- params$mean
+
+# safest extraction of sds (see below)
+
+
+```
+
+```{r}
+weights
+means_z
+params$variance
+```
+
+```{r}
+n_weeks <- 52 * 5   # e.g., 5 years of synthetic weeks
+params  <- gmm$parameters
+weights <- params$pro
+means_z <- params$mean
+
+sds_z <- sqrt(params$variance$sigmasq)
+sds_z <- rep(sds_z, params$variance$G)   # <-- key line
+
+sample_delta_z <- function(n = 1) {
+  k <- sample(seq_along(weights), size = n, replace = TRUE, prob = weights)
+  rnorm(n, mean = means_z[k], sd = sds_z[k])
+}
+
+delta_z_syn <- sample_delta_z(n_weeks)
+
+delta_syn <- delta_z_syn * scaler$sd + scaler$mu
+
+```
+
+```{r}
+s0 <- store_1_recon %>% pull(sales) %>% sample(1)
+
+sales_syn <- s0 + cumsum(delta_syn)
+
+```
+
+```{r}
+synthetic_sales <- tibble(
+  week = seq_len(n_weeks),
+  delta = delta_syn,
+  sales = sales_syn
+)
+
+```
+
+```{r}
+simulate_path <- function(horizon, s0) {
+  delta_z <- sample_delta_z(horizon)
+  delta   <- delta_z * scaler$sd + scaler$mu
+  s0 + cumsum(delta)
+}
+
+n_paths <- 1000
+horizon <- 52
+
+paths <- tibble(
+  sim_id = rep(1:n_paths, each = horizon),
+  step   = rep(1:horizon, times = n_paths)
+) %>%
+  group_by(sim_id) %>%
+  mutate(
+    s0 = sample(store_1_recon$sales, 1),
+    sales = simulate_path(horizon, s0)
+  ) %>%
+  ungroup()
+
+```
+
+### Writing and Exporting Everything
+
+```{r}
+
+store_1_recon |>
+  write_csv("recon/store-1-recon.csv")
+
+synthetic_sales |>
+  write_csv("synth-data/store-1-synth-sales.csv")
+
+paths |>
+  write_csv("synth-data/store-1-sales-paths.csv")
+```
+
+## Reconstructing and synthesizing store sales data from `Store 2`
+
+First we reconstruct sale data using:
+
+$$
+S_t = S_0 + \sum_{i=0}^{i=t} (S_{i+1} - S_i)
+$$
+
+```{r}
+
+sheets$`store-2` |>
+  mutate(
+    # Replace NA diff in week 1 with 0
+    diff = replace_na(difference_from_previous_week, 0),
+
+    # Reconstruct sales path with arbitrary start
+    sales_raw = cumsum(diff)
+  ) |>
+  mutate(
+    # Shift by constant so yearly mean matches the true mean
+    sales = sales_raw + (2425553 - mean(sales_raw))
+  ) |>
+  select(-diff, -sales_raw) -> store_2_recon
+```
+
+```{r}
+
+store_2_recon |>
+  mutate(
+    week_num = readr::parse_number(week)
+  ) |>
+  ggplot(aes(x = factor(week, levels = week[order(week_num)]), y = sales)) +
+  geom_col() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(
+    title = "Sales by Week",
+    x = "Week",
+    y = "Sales"
+  )
+```
+
+### Fitting a GMM and Examining It
+
+```{r}
+df_delta <- store_2_recon %>%
+  mutate(
+    difference_from_previous_week = as.numeric(difference_from_previous_week),
+    sales = as.numeric(sales)
+  ) %>%
+  filter(!is.na(difference_from_previous_week))
+
+# --- 2) Standardize deltas (important for GMM stability)
+scaler <- df_delta %>%
+  summarize(
+    mu = mean(difference_from_previous_week),
+    sd = sd(difference_from_previous_week)
+  )
+
+df_z <- df_delta %>%
+  mutate(
+    delta_z = (difference_from_previous_week - scaler$mu) / scaler$sd
+  )
+
+# --- 3) Fit GMM for k = 1..Kmax, select by BIC
+Kmax <- 6
+
+gmm <- Mclust(df_z$delta_z, G = 1:Kmax)
+
+# What did it pick?
+gmm$G
+summary(gmm)
+```
+
+```{r}
+gmm$G
+```
+
+```{r}
+plot(gmm, what = "BIC")
+```
+
+```{r}
+gmm$parameters
+```
+
+```{r}
+plot(gmm, what = "density")
+```
+
+### Creating Synthetic Values
+
+```{r}
+set.seed(42)
+
+params  <- gmm$parameters
+weights <- params$pro
+means_z <- params$mean
+
+# safest extraction of sds (see below)
+```
+
+```{r}
+weights
+means_z
+params$variance
+```
+
+```{r}
+n_weeks <- 52 * 5   # e.g., 5 years of synthetic weeks
+params  <- gmm$parameters
+weights <- params$pro
+means_z <- params$mean
+
+sds_z <- sqrt(params$variance$sigmasq)
+sds_z <- rep(sds_z, params$variance$G)   # <-- key line
+
+sample_delta_z <- function(n = 1) {
+  k <- sample(seq_along(weights), size = n, replace = TRUE, prob = weights)
+  rnorm(n, mean = means_z[k], sd = sds_z[k])
+}
+
+delta_z_syn <- sample_delta_z(n_weeks)
+
+delta_syn <- delta_z_syn * scaler$sd + scaler$mu
+```
+
+```{r}
+s0 <- store_2_recon %>% pull(sales) %>% sample(1)
+
+sales_syn <- s0 + cumsum(delta_syn)
+```
+
+```{r}
+synthetic_sales <- tibble(
+  week = seq_len(n_weeks),
+  delta = delta_syn,
+  sales = sales_syn
+)
+```
+
+```{r}
+simulate_path <- function(horizon, s0) {
+  delta_z <- sample_delta_z(horizon)
+  delta   <- delta_z * scaler$sd + scaler$mu
+  s0 + cumsum(delta)
+}
+
+n_paths <- 1000
+horizon <- 52
+
+paths <- tibble(
+  sim_id = rep(1:n_paths, each = horizon),
+  step   = rep(1:horizon, times = n_paths)
+) %>%
+  group_by(sim_id) %>%
+  mutate(
+    s0 = sample(store_1_recon$sales, 1),
+    sales = simulate_path(horizon, s0)
+  ) %>%
+  ungroup()
+```
+
+### Writing and Exporting Everything
+
+```{r}
+store_2_recon |>
+  write_csv("recon/store-2-recon.csv")
+
+synthetic_sales |>
+  write_csv("synth-data/store-2-synth-sales.csv")
+
+paths |>
+  write_csv("synth-data/store-2-sales-paths.csv")
+```
+
+## Reconstructing and synthesizing store sales data from `Store 3`
+
+First we reconstruct sale data using:
+
+$$
+S_t = S_0 + \sum_{i=0}^{i=t} (S_{i+1} - S_i)
+$$
+
+```{r}
+sheets$`store-3` |>
+  mutate(
+    # Replace NA diff in week 1 with 0
+    diff = replace_na(difference_from_previous_week, 0),
+
+    # Reconstruct sales path with arbitrary start
+    sales_raw = cumsum(diff)
+  ) |>
+  mutate(
+    # Shift by constant so yearly mean matches the true mean
+    sales = sales_raw + (2425553 - mean(sales_raw))
+  ) |>
+  select(-diff, -sales_raw) -> store_3_recon
+```
+
+```{r}
+store_3_recon |>
+  mutate(
+    week_num = readr::parse_number(week)
+  ) |>
+  ggplot(aes(x = factor(week, levels = week[order(week_num)]), y = sales)) +
+  geom_col() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(
+    title = "Sales by Week",
+    x = "Week",
+    y = "Sales"
+  )
+```
+
+### Fitting a GMM Model and Examining It
+
+```{r}
+df_delta <- store_3_recon %>%
+  mutate(
+    difference_from_previous_week = as.numeric(difference_from_previous_week),
+    sales = as.numeric(sales)
+  ) %>%
+  filter(!is.na(difference_from_previous_week))
+
+# --- 2) Standardize deltas (important for GMM stability)
+scaler <- df_delta %>%
+  summarize(
+    mu = mean(difference_from_previous_week),
+    sd = sd(difference_from_previous_week)
+  )
+
+df_z <- df_delta %>%
+  mutate(
+    delta_z = (difference_from_previous_week - scaler$mu) / scaler$sd
+  )
+
+# --- 3) Fit GMM for k = 1..Kmax, select by BIC
+Kmax <- 6
+
+gmm <- Mclust(df_z$delta_z, G = 1:Kmax)
+
+# What did it pick?
+gmm$G
+summary(gmm)
+```
+
+```{r}
+gmm$G
+```
+
+```{r}
+plot(gmm, what = "BIC")
+```
+
+```{r}
+gmm$parameters
+```
+
+```{r}
+plot(gmm, what = "density")
+```
+
+### Creating Synthetic Values
+
+```{r}
+set.seed(42)
+
+params  <- gmm$parameters
+weights <- params$pro
+means_z <- params$mean
+
+# safest extraction of sds (see below)
+```
+
+```{r}
+weights
+means_z
+params$variance
+```
+
+```{r}
+n_weeks <- 52 * 5   # e.g., 5 years of synthetic weeks
+params  <- gmm$parameters
+weights <- params$pro
+means_z <- params$mean
+
+sds_z <- sqrt(params$variance$sigmasq)
+sds_z <- rep(sds_z, params$variance$G)   # <-- key line
+
+sample_delta_z <- function(n = 1) {
+  k <- sample(seq_along(weights), size = n, replace = TRUE, prob = weights)
+  rnorm(n, mean = means_z[k], sd = sds_z[k])
+}
+
+delta_z_syn <- sample_delta_z(n_weeks)
+
+delta_syn <- delta_z_syn * scaler$sd + scaler$mu
+```
+
+```{r}
+s0 <- store_3_recon %>% pull(sales) %>% sample(1)
+
+sales_syn <- s0 + cumsum(delta_syn)
+```
+
+```{r}
+synthetic_sales <- tibble(
+  week = seq_len(n_weeks),
+  delta = delta_syn,
+  sales = sales_syn
+)
+```
+
+```{r}
+simulate_path <- function(horizon, s0) {
+  delta_z <- sample_delta_z(horizon)
+  delta   <- delta_z * scaler$sd + scaler$mu
+  s0 + cumsum(delta)
+}
+
+n_paths <- 1000
+horizon <- 52
+
+paths <- tibble(
+  sim_id = rep(1:n_paths, each = horizon),
+  step   = rep(1:horizon, times = n_paths)
+) %>%
+  group_by(sim_id) %>%
+  mutate(
+    s0 = sample(store_1_recon$sales, 1),
+    sales = simulate_path(horizon, s0)
+  ) %>%
+  ungroup()
+```
+
+### Writing and Exporting Everything
+
+```{r}
+store_2_recon |>
+  write_csv("recon/store-3-recon.csv")
+
+synthetic_sales |>
+  write_csv("synth-data/store-3-synth-sales.csv")
+
+paths |>
+  write_csv("synth-data/store-3-sales-paths.csv")
+```
+
+## Reconstructing and synthesizing store sales data from `Store 4`
+
+We reconstruct as before
+
+```{r}
+sheets$`store-4` |>
+  mutate(
+    # Replace NA diff in week 1 with 0
+    diff = replace_na(difference_from_previous_week, 0),
+
+    # Reconstruct sales path with arbitrary start
+    sales_raw = cumsum(diff)
+  ) |>
+  mutate(
+    # Shift by constant so yearly mean matches the true mean
+    sales = sales_raw + (2425553 - mean(sales_raw))
+  ) |>
+  select(-diff, -sales_raw) -> store_4_recon
+```
+
+```{r}
+store_4_recon |>
+  mutate(
+    week_num = readr::parse_number(week)
+  ) |>
+  ggplot(aes(x = factor(week, levels = week[order(week_num)]), y = sales)) +
+  geom_col() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(
+    title = "Sales by Week",
+    x = "Week",
+    y = "Sales"
+  )
+```
+
+### Fitting a GMM Model and Examining It
+
+```{r}
+df_delta <- store_4_recon %>%
+  mutate(
+    difference_from_previous_week = as.numeric(difference_from_previous_week),
+    sales = as.numeric(sales)
+  ) %>%
+  filter(!is.na(difference_from_previous_week))
+
+# --- 2) Standardize deltas (important for GMM stability)
+scaler <- df_delta %>%
+  summarize(
+    mu = mean(difference_from_previous_week),
+    sd = sd(difference_from_previous_week)
+  )
+
+df_z <- df_delta %>%
+  mutate(
+    delta_z = (difference_from_previous_week - scaler$mu) / scaler$sd
+  )
+
+# --- 3) Fit GMM for k = 1..Kmax, select by BIC
+Kmax <- 6
+
+gmm <- Mclust(df_z$delta_z, G = 1:Kmax)
+
+# What did it pick?
+gmm$G
+summary(gmm)
+plot(gmm, what = "BIC")
+gmm$parameters
+plot(gmm, what = "density")
+```
+
+### Creating Synthetic Values
+
+```{r}
+set.seed(42)
+
+params  <- gmm$parameters
+weights <- params$pro
+means_z <- params$mean
+
+weights
+means_z
+params$variance
+
+# safest extraction of sds (see below)
+```
+
+```{r}
+n_weeks <- 52 * 5   # e.g., 5 years of synthetic weeks
+params  <- gmm$parameters
+weights <- params$pro
+means_z <- params$mean
+
+sds_z <- sqrt(params$variance$sigmasq)
+sds_z <- rep(sds_z, params$variance$G)   # <-- key line
+
+sample_delta_z <- function(n = 1) {
+  k <- sample(seq_along(weights), size = n, replace = TRUE, prob = weights)
+  rnorm(n, mean = means_z[k], sd = sds_z[k])
+}
+
+delta_z_syn <- sample_delta_z(n_weeks)
+
+delta_syn <- delta_z_syn * scaler$sd + scaler$mu
+```
+
+```{r}
+s0 <- store_4_recon %>% pull(sales) %>% sample(1)
+
+sales_syn <- s0 + cumsum(delta_syn)
+```
+
+```{r}
+synthetic_sales <- tibble(
+  week = seq_len(n_weeks),
+  delta = delta_syn,
+  sales = sales_syn
+)
+```
+
+```{r}
+simulate_path <- function(horizon, s0) {
+  delta_z <- sample_delta_z(horizon)
+  delta   <- delta_z * scaler$sd + scaler$mu
+  s0 + cumsum(delta)
+}
+
+n_paths <- 1000
+horizon <- 52
+
+paths <- tibble(
+  sim_id = rep(1:n_paths, each = horizon),
+  step   = rep(1:horizon, times = n_paths)
+) %>%
+  group_by(sim_id) %>%
+  mutate(
+    s0 = sample(store_1_recon$sales, 1),
+    sales = simulate_path(horizon, s0)
+  ) %>%
+  ungroup()
+```
+
+### Writing and Exporting Everything
+
+```{r}
+store_4_recon |>
+  write_csv("recon/store-4-recon.csv")
+
+synthetic_sales |>
+  write_csv("synth-data/store-4-synth-sales.csv")
+
+paths |>
+  write_csv("synth-data/store-4-sales-paths.csv")
+```
+
+## **Reconstructing and synthesizing store sales data from `Store 5`**
+
+```{r}
+sheets$`store-5` |>
+  mutate(
+    # Replace NA diff in week 1 with 0
+    diff = replace_na(difference_from_previous_week, 0),
+
+    # Reconstruct sales path with arbitrary start
+    sales_raw = cumsum(diff)
+  ) |>
+  mutate(
+    # Shift by constant so yearly mean matches the true mean
+    sales = sales_raw + (2425553 - mean(sales_raw))
+  ) |>
+  select(-diff, -sales_raw) -> store_5_recon
+```
+
+```{r}
+store_5_recon |>
+  mutate(
+    week_num = readr::parse_number(week)
+  ) |>
+  ggplot(aes(x = factor(week, levels = week[order(week_num)]), y = sales)) +
+  geom_col() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(
+    title = "Sales by Week",
+    x = "Week",
+    y = "Sales"
+  )
+```
+
+### Fitting a GMM model and examining it
+
+```{r}
+df_delta <- store_5_recon %>%
+  mutate(
+    difference_from_previous_week = as.numeric(difference_from_previous_week),
+    sales = as.numeric(sales)
+  ) %>%
+  filter(!is.na(difference_from_previous_week))
+
+# --- 2) Standardize deltas (important for GMM stability)
+scaler <- df_delta %>%
+  summarize(
+    mu = mean(difference_from_previous_week),
+    sd = sd(difference_from_previous_week)
+  )
+
+df_z <- df_delta %>%
+  mutate(
+    delta_z = (difference_from_previous_week - scaler$mu) / scaler$sd
+  )
+
+# --- 3) Fit GMM for k = 1..Kmax, select by BIC
+Kmax <- 6
+
+gmm <- Mclust(df_z$delta_z, G = 1:Kmax)
+
+# What did it pick?
+gmm$G
+summary(gmm)
+plot(gmm, what = "BIC")
+gmm$parameters
+plot(gmm, what = "density")
+```
+
+### Creating Synthetic Values
+
+```{r}
+set.seed(42)
+
+params  <- gmm$parameters
+weights <- params$pro
+means_z <- params$mean
+
+weights
+means_z
+params$variance
+```
+
+```{r}
+n_weeks <- 52 * 5   # e.g., 5 years of synthetic weeks
+params  <- gmm$parameters
+weights <- params$pro
+means_z <- params$mean
+
+sds_z <- sqrt(params$variance$sigmasq)
+sds_z <- rep(sds_z, params$variance$G)   # <-- key line
+
+sample_delta_z <- function(n = 1) {
+  k <- sample(seq_along(weights), size = n, replace = TRUE, prob = weights)
+  rnorm(n, mean = means_z[k], sd = sds_z[k])
+}
+
+delta_z_syn <- sample_delta_z(n_weeks)
+
+delta_syn <- delta_z_syn * scaler$sd + scaler$mu
+```
+
+```{r}
+s0 <- store_5_recon %>% pull(sales) %>% sample(1)
+
+sales_syn <- s0 + cumsum(delta_syn)
+```
+
+```{r}
+synthetic_sales <- tibble(
+  week = seq_len(n_weeks),
+  delta = delta_syn,
+  sales = sales_syn
+)
+```
+
+```{r}
+simulate_path <- function(horizon, s0) {
+  delta_z <- sample_delta_z(horizon)
+  delta   <- delta_z * scaler$sd + scaler$mu
+  s0 + cumsum(delta)
+}
+
+n_paths <- 1000
+horizon <- 52
+
+paths <- tibble(
+  sim_id = rep(1:n_paths, each = horizon),
+  step   = rep(1:horizon, times = n_paths)
+) %>%
+  group_by(sim_id) %>%
+  mutate(
+    s0 = sample(store_1_recon$sales, 1),
+    sales = simulate_path(horizon, s0)
+  ) %>%
+  ungroup()
+```
+
+### Writing and Exporting Everything
+
+```{r}
+store_5_recon |>
+  write_csv("recon/store-5-recon.csv")
+
+synthetic_sales |>
+  write_csv("synth-data/store-5-synth-sales.csv")
+
+paths |>
+  write_csv("synth-data/store-5-sales-paths.csv")
+```
