@@ -1,0 +1,119 @@
+---
+title: "Differentially Private Gaussian Mixture Synthesis"
+author: "Shakil A. Rafi, Ph.D."
+format:
+  html:
+    toc: true
+    embed-resources: true
+    code-fold: true
+execute:
+  warning: false
+---
+
+```{r setup}
+library(ggplot2)
+source("R/dp_gmm.R")
+util <- read.csv("dp-results/utility.csv")
+audit <- read.csv("dp-results/audit.csv")
+ledger <- read.csv("dp-synth-data/privacy-ledger.csv")
+params <- read.csv("dp-synth-data/dp-model-params.csv")
+```
+
+## Why this exists
+
+The first version of this project (`analysis.qmd`) fit Gaussian mixtures to each store's weekly changes and sampled new series from them. It described itself as privacy preserving, but it was not. It chose the number of components with BIC computed on the raw data, started each synthetic path from a value sampled from the true series, and published the reconstructed sales alongside the synthetic ones. Nothing about the output was protected.
+
+This document describes the replacement: a differentially private fit with an explicit, auditable privacy budget, and an honest measurement of what that privacy costs on data this small.
+
+## What is guaranteed
+
+- **Unit of protection:** one row of a store's weekly-change table (add or remove one record).
+- **Guarantee:** each store's released model and level are $(\varepsilon, \delta)$-differentially private with $\varepsilon = 8$ and $\delta = 10^{-5}$. Stores are processed on disjoint records.
+- **Mechanism:** the Gaussian mechanism on the EM sufficient statistics, accounted with zero-concentrated DP (zCDP) and converted with $\varepsilon = \rho + 2\sqrt{\rho \ln(1/\delta)}$. The yearly mean level is released separately with its own noise. 90% of the budget goes to the model and 10% to the level.
+- **Public choices:** the number of components $K$, the clipping bound, the initial parameters, the number of iterations, and the variance range. None are learned from the data. Weekly changes beyond the bound are clipped, which is what bounds each record's influence.
+- **Post-processing:** the synthetic series and any number of simulated paths come from the released parameters only, so they cost no extra budget.
+
+::: callout-warning
+## What it does not guarantee
+
+- **Row level, not store level.** A single weekly sales value appears in two adjacent weekly changes and in the yearly mean, so protecting one underlying sales figure is weaker than the stated $\varepsilon$ (group privacy). Protecting a whole store's year would need much more noise.
+- **One release per store.** The ledger records a single run per store. Re-running with a new seed on the same data spends new budget.
+- **The inputs must stay private.** This repository still contains `raw-data.xlsx`, `raw-csv/`, `recon/`, and the old non-private `synth-data/`. They are first-pass synthetic or summarized inputs, which is why they are here. With real data, none of them could be published, and a differentially private release would mean nothing next to them.
+- **Bounds were chosen after looking at the data.** The clipping bound and the choice $K = 1$ were set after the evaluation below, which used the private inputs. That is a small leak not covered by the stated $\varepsilon$. Production use should fix them from domain knowledge or spend budget on a private estimate.
+:::
+
+## The privacy-versus-accuracy trade-off
+
+Accuracy is measured as the Wasserstein-1 distance between the fitted model and the real weekly changes, in units of the real standard deviation (smaller is better). Each point averages 200 private fits per store. The non-private fit shows the best the model family can do; the uninformed model is a fixed guess that uses no data.
+
+```{r utility-plot}
+u <- subset(util, method == "dp")
+agg <- aggregate(w1 ~ K + bound + epsilon, u, mean)
+agg$K <- paste("K =", agg$K)
+agg$bound <- paste0("clip ±", format(agg$bound, scientific = FALSE, big.mark = ","))
+refs <- aggregate(w1 ~ K + bound + method, subset(util, method != "dp"), mean)
+refs$K <- paste("K =", refs$K)
+refs$bound <- paste0("clip ±", format(refs$bound, scientific = FALSE, big.mark = ","))
+ggplot(agg, aes(epsilon, w1)) +
+  geom_line() + geom_point() +
+  geom_hline(data = refs, aes(yintercept = w1, linetype = method), colour = "grey35") +
+  scale_x_log10(breaks = c(0.5, 1, 2, 4, 8)) +
+  facet_grid(K ~ bound) +
+  labs(x = expression(epsilon ~ "(log scale)"), y = "Distance to real weekly changes",
+       linetype = NULL) +
+  theme_minimal()
+```
+
+```{r utility-table}
+k1 <- subset(util, K == 1 & bound == 5e5 & method == "dp")
+t1 <- aggregate(cbind(w1, mean_err) ~ epsilon, k1, mean)
+t1$sd_ratio <- aggregate(sd_ratio ~ epsilon, k1, median)$sd_ratio
+np <- subset(util, K == 1 & bound == 5e5 & method == "nonprivate")
+un <- subset(util, K == 1 & bound == 5e5 & method == "uninformed")
+t1 <- rbind(t1,
+  data.frame(epsilon = Inf, w1 = mean(np$w1), mean_err = mean(np$mean_err), sd_ratio = mean(np$sd_ratio)))
+names(t1) <- c("epsilon", "distance", "mean error", "sd ratio")
+knitr::kable(t1, digits = 3, caption = "Single Gaussian, clip ±500,000, averaged over the five stores. Epsilon Inf is the non-private fit; the uninformed guess has distance 0.28 in this setting. Mean error is in units of the real standard deviation; sd ratio is fitted over real (1 is ideal).")
+```
+
+What I take from this:
+
+- **Small data limits privacy.** With about 51 weekly changes per store, noise at $\varepsilon \le 2$ swamps the signal. The private fit is only marginally better than the uninformed guess at $\varepsilon = 4$ and clearly better at $\varepsilon = 8$, and even there it is above the non-private fit.
+- **One Gaussian beats two components.** At every budget the two-component fit is worse, so I fixed $K = 1$ for the release. The original BIC analysis already preferred one component for three of the five stores. A mixture needs many more records per component than this data has. The code supports $K > 1$ for data with thousands of rows, such as real transaction data, which is where this approach should help.
+- **A tighter clipping bound helps.** Clipping at ±500,000 beats ±1,000,000 because less noise is needed, at the cost of some bias.
+
+## What was released
+
+```{r ledger}
+ledger$epsilon_spent <- round(ledger$epsilon_spent, 3)
+ledger$rho_total <- round(ledger$rho_total, 3)
+knitr::kable(ledger[, c("store", "K", "clip_bound", "epsilon_spent", "delta", "level_released", "level_source_check")],
+             caption = "Privacy ledger: one release per store.")
+```
+
+```{r params}
+knitr::kable(params, digits = 0, caption = "Released model parameters (dollars per week).")
+```
+
+## Problems in the original analysis
+
+```{r audit}
+a <- audit[, c("store", "summary_level_mean", "recon_level_sd", "summary_level_sd", "sd_matches_labeled_row", "sd_closest_row", "sim_52wk_sd_nonprivate_K2", "lag1_autocorr_real")]
+names(a) <- c("store", "labeled mean", "reconstructed sd", "labeled sd", "sd matches", "closest row", "simulated sd", "lag-1 autocorr")
+knitr::kable(a, digits = c(0, 0, 0, 0, 0, 0, 0, 2))
+```
+
+1. **Wrong level for four stores.** The original code shifted every store's reconstructed series to 2,425,553, which is Store 1's yearly mean. Stores 2 to 5 each have their own mean in the workbook's summary sheet. The new pipeline uses each store's own mean.
+2. **Sheet and summary rows disagree for three stores.** The reconstructed standard deviation matches the labeled summary row for Stores 1 and 2 to the dollar, but for Stores 3, 4, and 5 it matches the rows for Stores 6, 3, and 7. Either the sheets or the summary labels are misassigned. I used the labeled rows and flagged this in the ledger. Someone should check the workbook source.
+3. **Synthetic paths spread too widely.** Real weekly changes are negatively correlated (lag-1 autocorrelation between −0.17 and −0.32), because sales levels revert toward their mean. Sampling changes independently makes a random walk, so a simulated year has a standard deviation of roughly 340,000 to 760,000, against 116,000 to 311,000 in the data. I limited the release to 52 weeks for this reason, but the generator itself still needs a model of dependence.
+
+## Reproduce
+
+```bash
+Rscript -e 'testthat::test_dir("tests/testthat")'   # privacy and calibration tests
+Rscript scripts/dp_evaluate.R                       # utility study (reads private inputs)
+Rscript scripts/dp_release.R                        # the single release (reads private inputs)
+quarto render dp-analysis.qmd
+```
+
+The tests check that one record can never move the statistics by more than the stated sensitivity, that the noise has the calibrated standard deviation, that the budget ledger adds up, and that a very large budget recovers a known mixture.
