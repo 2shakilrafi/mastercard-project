@@ -18,7 +18,7 @@ Read [`dp-analysis.qmd`](dp-analysis.qmd) (rendered as `dp-analysis.html`) for t
 - The number of components, the clipping bound, the initialization, and the iteration count are public and not learned from the data.
 - Synthetic series are generated from the released parameters only, so generating more of them costs no extra budget.
 
-Limits, stated plainly:
+Limitations:
 
 - With about 51 weekly changes per store, privacy at small $\varepsilon$ costs a lot of accuracy. The release uses a single Gaussian ($K = 1$), because mixtures do worse at these budgets. The code supports $K > 1$ for larger datasets.
 - Protecting a single underlying weekly sales value is weaker than the stated $\varepsilon$, because that value appears in several rows.
@@ -63,6 +63,6 @@ quarto render analysis.qmd
 
 Review the diff before committing regenerated output.
 
-## Responsible reuse
+## Reusing this repository
 
-Confirm the provenance, confidentiality requirements, and permission to redistribute every input before reusing this repository. A differentially private release only protects the data it was computed from if the inputs stay private. With real data, `raw-csv/`, `raw-data.xlsx`, `recon/`, and the non-private `synth-data/` must not be published.
+Before reusing anything here, confirm where each input came from, whether it is confidential, and whether you may redistribute it. A differentially private release only protects the data it was computed from if the inputs stay private. With real data, `raw-csv/`, `raw-data.xlsx`, `recon/`, and the non-private `synth-data/` must not be published.
